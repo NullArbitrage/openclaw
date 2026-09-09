@@ -14,6 +14,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -128,12 +129,53 @@ class DeviceHandlerTest {
 
   @Test
   fun handleDeviceStatus_reportsBatteryLevelAsFractionAndPercent() {
+    val readings =
+      listOf(
+        Triple(0 to 100, 0.0, 0L),
+        Triple(1 to 8, 0.125, 13L),
+        Triple(50 to 100, 0.5, 50L),
+        Triple(100 to 100, 1.0, 100L),
+      )
+
+    for ((reading, expectedLevel, expectedPercent) in readings) {
+      val battery = batteryStatus(reading.first, reading.second)
+
+      assertEquals(expectedLevel, battery.getValue("level").jsonPrimitive.double, 0.0)
+      assertEquals(
+        expectedPercent,
+        battery
+          .getValue("levelPercent")
+          .jsonPrimitive
+          .content
+          .toLong(),
+      )
+      assertEquals("unplugged", battery.getValue("state").jsonPrimitive.content)
+      assertFalse(battery.getValue("lowPowerModeEnabled").jsonPrimitive.boolean)
+    }
+  }
+
+  @Test
+  fun handleDeviceStatus_omitsUnavailableBatteryLevelAndPercent() {
+    for ((level, scale) in listOf(null to 100, -1 to 100, 50 to null, 50 to 0, 50 to -1)) {
+      val battery = batteryStatus(level, scale)
+
+      assertFalse("level=$level scale=$scale", battery.containsKey("level"))
+      assertFalse("level=$level scale=$scale", battery.containsKey("levelPercent"))
+      assertEquals("unplugged", battery.getValue("state").jsonPrimitive.content)
+      assertFalse(battery.getValue("lowPowerModeEnabled").jsonPrimitive.boolean)
+    }
+  }
+
+  private fun batteryStatus(
+    level: Int?,
+    scale: Int?,
+  ): JsonObject {
     val app = appContext()
     val batteryIntent =
       Intent(Intent.ACTION_BATTERY_CHANGED)
-        .putExtra(BatteryManager.EXTRA_LEVEL, 50)
-        .putExtra(BatteryManager.EXTRA_SCALE, 100)
         .putExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_DISCHARGING)
+    level?.let { batteryIntent.putExtra(BatteryManager.EXTRA_LEVEL, it) }
+    scale?.let { batteryIntent.putExtra(BatteryManager.EXTRA_SCALE, it) }
     // Seed the sticky ACTION_BATTERY_CHANGED broadcast that readBatterySnapshot()
     // consumes via registerReceiver(null, ...). Context.sendStickyBroadcast is the
     // only non-reflection way to populate that sticky state under Robolectric.
@@ -144,21 +186,7 @@ class DeviceHandlerTest {
     val result = handler.handleDeviceStatus(null)
 
     assertTrue(result.ok)
-    val battery =
-      parsePayload(result.payloadJson)
-        .getValue("battery")
-        .jsonObject
-    // level is a normalized 0.0–1.0 fraction (50/100 -> 0.5), never a raw level (50).
-    assertEquals(0.5, battery.getValue("level").jsonPrimitive.double, 1.0e-9)
-    // levelPercent mirrors the fraction as an integer percentage (0.5 -> 50).
-    assertEquals(
-      50L,
-      battery
-        .getValue("levelPercent")
-        .jsonPrimitive
-        .content
-        .toLong(),
-    )
+    return parsePayload(result.payloadJson).getValue("battery").jsonObject
   }
 
   @Test
