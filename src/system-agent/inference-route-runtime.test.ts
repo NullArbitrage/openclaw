@@ -162,6 +162,59 @@ it("keeps protected credentials through a fresh setup read and verified-route re
   expect(await resolveSystemAgentVerifiedInferenceRoute(binding, deps)).toBeNull();
 });
 
+it("keeps a staged replacement credential authoritative at binding creation", async () => {
+  const snapshot = await readSnapshot();
+  // An unsaved candidate replaces the provider key while the on-disk config
+  // still references the old store-backed credential. Route identity is
+  // unchanged: same provider, model, agent, and harness — exactly the shape
+  // setup activation uses when repairing a credential before committing it.
+  const candidate = cloneConfigWithResolutionFacts(snapshot.runtimeConfig);
+  const provider = candidate.models?.providers?.fixture;
+  if (!provider) {
+    throw new Error("Missing fixture provider");
+  }
+  provider.apiKey = "synthetic-replacement-key";
+  const candidateRoute = await resolveSystemAgentConfiguredRouteFromConfig(
+    candidate,
+    "main",
+    { pluginMetadataPlugins: [] },
+    snapshot,
+  );
+  expect(candidateRoute).not.toBeNull();
+  // The probe succeeded using the candidate's replacement credential.
+  const replacementAuth = await resolveApiKeyForProviderCore({
+    cfg: candidateRoute!.runConfig,
+    provider: "fixture",
+    modelId: "test-model",
+    modelApi: "openai-responses",
+    agentDir: candidateRoute!.agentDir,
+    store: { version: 1, profiles: {} },
+    allowAuthProfileFallback: false,
+    secretSentinels: true,
+  });
+  const probeFingerprint = fingerprintResolvedProviderAuth(replacementAuth);
+  expect(probeFingerprint).toBeDefined();
+  // Binding creation must validate against the candidate's own material, not
+  // the on-disk route's old credential: rejecting here would block every
+  // same-route credential repair at activation time.
+  const binding = await createSystemAgentVerifiedInferenceBinding({
+    configuredRoute: candidateRoute!,
+    executionRoute: candidateRoute!,
+    auth: {
+      agentHarnessId: "openclaw",
+      modelId: "test-model",
+      modelApi: "openai-responses",
+      authFingerprint: probeFingerprint,
+    },
+    deps: { pluginMetadataPlugins: [] },
+  });
+  // The binding records the credential the probe actually used: the
+  // candidate's replacement material, not the on-disk route's old key.
+  expect(binding.auth.authFingerprint).toBe(probeFingerprint);
+  // The on-disk config is untouched: the candidate has not been committed.
+  expect((await readRuntime()).models?.providers?.fixture?.apiKey).toEqual(secretRef);
+});
+
 it.each([
   {
     label: "protected key",

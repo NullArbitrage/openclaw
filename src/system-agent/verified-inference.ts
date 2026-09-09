@@ -229,6 +229,23 @@ function systemAgentRouteIdentity(
   return identity;
 }
 
+/**
+ * The authored credential a route's provider entry declares. This is the
+ * pointer, not the material: a store-backed SecretRef compares equal across
+ * probe and live routes when both ran against the same configuration, while
+ * materialized literals compare by value. Used to discriminate a staged
+ * candidate credential replacement (differing authored credential) from
+ * store-side rotation of an unchanged configuration (same authored
+ * credential, differing material).
+ */
+function authoredProviderCredential(
+  route: SystemAgentConfiguredRoute,
+): { provider: string; apiKey: unknown } | undefined {
+  const provider = route.provider;
+  const apiKey = route.sourceConfig.models?.providers?.[provider]?.apiKey;
+  return { provider, apiKey };
+}
+
 async function resolveCurrentRuntimeOwnerFingerprint(params: {
   route: SystemAgentVerifiedExecutionRoute;
   kind: OpaqueRuntimeOwnerKind;
@@ -758,6 +775,56 @@ export async function createSystemAgentVerifiedInferenceBinding(params: {
     }
     currentRuntimeArtifactFingerprint = artifact.fingerprint;
   }
+  // Credential proof must describe live authority, not the frozen probe-time
+  // materialization. The prepared probe route materializes store-backed
+  // references into literals, so a store rotation between probe success and
+  // binding creation is invisible to a frozen re-resolution — the digest would
+  // compare stale material and accept a rotated-out credential. Re-resolve
+  // through the live route in that case.
+  //
+  // But a staged candidate is authoritative until commit: setup deliberately
+  // passes an unsaved candidate whose replacement credential differs from the
+  // on-disk route. Discriminate on the authored provider credential (the
+  // pointer, not the material): only refresh through the live route when the
+  // probe ran against the same authored credential the live route uses. A
+  // differing authored credential means the probe tested candidate material,
+  // which must be preserved — the persistent revalidation boundary re-checks
+  // committed state on first use.
+  let credentialExecution: SystemAgentVerifiedExecutionRoute = execution;
+  try {
+    const readSnapshot =
+      deps.readConfigFileSnapshot ?? (await import("../config/config.js")).readConfigFileSnapshot;
+    const liveSnapshot = await readSnapshot();
+    if (liveSnapshot.exists && liveSnapshot.valid) {
+      const liveConfig = liveSnapshot.runtimeConfig ?? liveSnapshot.config;
+      const liveRoute = await resolveSystemAgentConfiguredRouteFromConfig(
+        liveConfig,
+        execution.agentId,
+        deps,
+        liveSnapshot,
+      );
+      if (
+        liveRoute &&
+        isDeepStrictEqual(
+          systemAgentRouteIdentity(liveRoute),
+          systemAgentRouteIdentity(params.configuredRoute),
+        ) &&
+        isDeepStrictEqual(
+          authoredProviderCredential(liveRoute),
+          authoredProviderCredential(execution),
+        )
+      ) {
+        credentialExecution = {
+          ...execution,
+          sourceConfig: liveRoute.sourceConfig,
+          runConfig: liveRoute.runConfig,
+        };
+      }
+    }
+  } catch {
+    // Unreadable current config: keep the frozen probe route. The persistent
+    // revalidation boundary re-checks the credential before any live use.
+  }
   const currentAuthFingerprint = await (proofKind === "runtime-owner"
     ? resolveCurrentRuntimeOwnerFingerprint({
         route: execution,
@@ -771,7 +838,7 @@ export async function createSystemAgentVerifiedInferenceBinding(params: {
         deps,
       })
     : resolveCurrentAuthFingerprint({
-        route: execution,
+        route: credentialExecution,
         ...(authProfileId ? { authProfileId } : {}),
         ...(modelId ? { modelId } : {}),
         ...(modelApi ? { modelApi } : {}),
